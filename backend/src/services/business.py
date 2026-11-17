@@ -1,6 +1,10 @@
 """沿线路里程的一维DBSCAN缺陷密度聚类，保留噪声点。"""
 import numpy as np
-from sklearn.cluster import DBSCAN
+from src.services import clustering
+from src.services.clustering import (
+    BASELINE_ENGINE, SEVERITY_CORE_ENGINE, ENGINES,
+    dbscan_1d, eligibility, method_text,
+)
 
 
 def metadata():
@@ -35,7 +39,11 @@ def seed_records():
     return sorted(rows, key=lambda row: row["mileage_km"])
 
 
-def analyze(records, params):
+def analyze(records, params, rule=None):
+    """按指定规则版本计算。rule 为 None 时按 v1 基础口径，保持历史结果不变。"""
+    engine_key = (rule or {}).get("engine_key", BASELINE_ENGINE)
+    config = (rule or {}).get("config", {}) or {}
+    rule_code = (rule or {}).get("code", "v1")
     try:
         eps = float(params.get("eps_m", 100))
         raw_min = float(params.get("min_points", 5))
@@ -54,7 +62,7 @@ def analyze(records, params):
         raise ValueError("里程、横向偏差与复核等级必须完整且为数值。") from exc
     if not np.isfinite(np.column_stack([mileage, lateral, severity])).all() or (mileage < 0).any() or not np.isin(severity, [1, 2, 3, 4, 5]).all():
         raise ValueError("里程须非负有限，横向偏差须有限，复核等级须为1~5整数。")
-    labels = DBSCAN(eps=eps, min_samples=minimum).fit_predict((mileage * 1000).reshape(-1, 1))
+    labels, core_mask = dbscan_1d(mileage * 1000, eps, minimum, eligibility(engine_key, config, severity))
     clusters = sorted([int(v) for v in np.unique(labels) if v >= 0], key=lambda v: float(np.min(mileage[labels == v])))
     rows = []
     for display, cluster in enumerate(clusters, 1):
@@ -66,11 +74,27 @@ def analyze(records, params):
     high_noise = int(np.sum(noise & (severity >= 4)))
     if noise_count:
         rows.append({"band": "孤立/稀疏点", "count": noise_count, "from_km": round(float(mileage[noise].min()), 4), "to_km": round(float(mileage[noise].max()), 4), "span_m": "—", "max_severity": int(severity[noise].max()), "mean_lateral": round(float(lateral[noise].mean()), 2), "review": "逐点复核，不连成区段"})
+    # 逐点归属：影子回放逐点比较分组变化、历史结果复现都依赖这份固定快照。
+    band_names = {cluster: f"缺陷带{display}" for display, cluster in enumerate(clusters, 1)}
+    point_assignments = [
+        {
+            "defect_id": str(row.get("defect_id", idx)),
+            "mileage_km": round(float(mileage[idx]), 4),
+            "severity": int(severity[idx]),
+            "group": band_names.get(int(labels[idx]), "孤立/稀疏点"),
+            "is_core": bool(core_mask[idx]),
+            "point_role": "核心点" if core_mask[idx] else ("边界点" if labels[idx] >= 0 else "噪声点"),
+        }
+        for idx, row in enumerate(records)
+    ]
+    method = method_text(engine_key, config)
     return {
         "summary": f"在{len(records)}个缺陷点中识别{len(clusters)}条密集带，保留{noise_count}个孤立/稀疏点；邻域半径{eps:g}米。",
         "metrics": [{"label": "密集缺陷带", "value": len(clusters), "unit": "条"}, {"label": "密集带内点数", "value": int((labels >= 0).sum())}, {"label": "噪声占比", "value": round(noise_count / len(records) * 100, 2), "unit": "%"}, {"label": "孤立高等级点", "value": high_noise}],
         "table": {"columns": [{"key": "band", "label": "密度分组"}, {"key": "count", "label": "缺陷点数"}, {"key": "from_km", "label": "起点km"}, {"key": "to_km", "label": "终点km"}, {"key": "span_m", "label": "跨度m"}, {"key": "max_severity", "label": "最高等级"}, {"key": "mean_lateral", "label": "平均横偏mm"}, {"key": "review", "label": "复核动作"}], "rows": rows},
         "chart": {"type": "bar", "labels": [row["band"] for row in rows], "series": [{"name": "缺陷点数", "values": [row["count"] for row in rows]}]},
         "findings": [f"孤立点中有{high_noise}个等级≥4的缺陷，不能因为被标为噪声而忽略。", "收紧邻域半径会使密度带分裂或增加噪声；扩大半径可能把相邻问题连接。", "缺陷带按起始里程排序，标签仅用于定位，不表示处理优先级。"],
-        "method": metadata()["method"], "warnings": ["噪声仅指不满足当前密度条件，不代表无效数据或低风险。"] + (["当前参数未识别出密集带，可核查数据范围或适度增大半径。"] if not clusters else []),
+        "method": method, "warnings": ["噪声仅指不满足当前密度条件，不代表无效数据或低风险。"] + (["当前参数未识别出密集带，可核查数据范围或适度增大半径。"] if not clusters else []),
+        "point_assignments": point_assignments,
+        "rule": {"code": rule_code, "engine_key": engine_key, "config": config},
     }

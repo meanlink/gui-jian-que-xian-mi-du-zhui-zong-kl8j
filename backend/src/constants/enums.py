@@ -8,3 +8,12 @@ class JobStatus(str, Enum):
     running = 'running'
     completed = 'completed'
     failed = 'failed'
+class RuleStatus(str, Enum):
+    candidate = 'candidate'
+    active = 'active'
+    retired = 'retired'
+class ReplayStatus(str, Enum):
+    pending = 'pending'
+    running = 'running'
+    completed = 'completed'
+    failed = 'failed'
